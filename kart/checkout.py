@@ -17,6 +17,7 @@ from kart.promisor_utils import get_partial_clone_envelope
 from kart.spatial_filter import SpatialFilterString, spatial_filter_help_text
 from kart.structs import CommitWithReference
 from kart import subprocess_util as subprocess
+from kart.workdir import AttachmentWorkdirIndex
 
 
 _DISCARD_CHANGES_HELP_MESSAGE = (
@@ -538,18 +539,26 @@ def _restore_attachment_files(repo, source_tree, rel_paths):
     Paths that do not exist as files in source_tree are silently skipped, so callers can safely
     pass the same filter list that was used for dataset restore (the reviewer's preferred approach:
     each filter is tried on both sides; the side that matches wins).
+
+    Successfully restored paths are also added to the workdir-index so that future calls to
+    WorkdirDiffCache.dirty_attachment_paths() can detect changes efficiently via git's mtime
+    optimisation rather than hashing all tracked files on every diff.
     """
     workdir = str(repo.workdir_path)
+    restored = []
     for rel_path in rel_paths:
         try:
             subprocess.check_call(
                 ["git", "-C", workdir, "checkout", source_tree.id.hex, "--", rel_path],
                 stderr=subprocess.DEVNULL,
             )
+            restored.append(rel_path)
         except subprocess.CalledProcessError:
             # Path doesn't exist as a file in source_tree (e.g. it's a dataset name or
             # feature key) — silently skip so the caller can pass unfiltered user args.
             pass
+    if restored:
+        _update_attachment_workdir_index(repo, restored)
 
 
 def _restore_all_attachment_files(repo, source_tree):
@@ -561,6 +570,19 @@ def _restore_all_attachment_files(repo, source_tree):
     if not tracked:
         return
     _restore_attachment_files(repo, source_tree, sorted(tracked))
+
+
+def _update_attachment_workdir_index(repo, rel_paths):
+    """
+    Ensures the workdir-index exists and records the given paths in it.
+
+    Called after attachment files are written to the working directory so that
+    WorkdirDiffCache.dirty_attachment_paths() can detect subsequent changes via git's mtime
+    optimisation (avoiding a full re-hash of every tracked attachment on every diff).
+    """
+    ai = AttachmentWorkdirIndex(repo)
+    ai.create_if_missing()
+    ai.add_paths_to_index(rel_paths)
 
 
 def _remove_deleted_attachment_files(repo, old_tree, new_tree):

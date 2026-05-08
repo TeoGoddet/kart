@@ -167,7 +167,13 @@ class WorkingCopy:
     def workdir_diff_cache(self):
         """Returns a WorkdirDiffCache for caching the results of certain workdir operations over the course of a single diff."""
         w = self.workdir
-        return w.workdir_diff_cache() if w else None
+        if w is not None:
+            return w.workdir_diff_cache()
+        # No tile datasets, but there may be an attachment-only workdir-index.
+        from kart.workdir import AttachmentWorkdirIndex
+
+        ai = AttachmentWorkdirIndex(self.repo)
+        return ai.workdir_diff_cache() if ai.index_path.is_file() else None
 
     def create_parts_if_missing(
         self, parts_to_create, reset_to=DONT_RESET, non_checkout_datasets=None

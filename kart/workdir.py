@@ -852,33 +852,49 @@ class FileSystemWorkingCopy(WorkingCopyPart):
         assert isinstance(dataset, TileDataset)
         dataset.write_mosaic_for_directory((self.path / dataset.path).resolve())
 
-    def dirty_paths(self):
+    def _git_diff_paths(self):
+        """
+        Returns paths tracked in the workdir-index that differ from the working directory
+        (files that are modified or deleted). Uses git's mtime optimisation so unchanged
+        large files are not re-hashed.
+        """
         env_overrides = {"GIT_INDEX_FILE": str(self.index_path)}
-
         try:
-            # This finds all files in the index that have been modified - and updates any mtimes in the index
-            # if the mtimes are stale but the files are actually unchanged (as in GIT_DIFF_UPDATE_INDEX).
-            cmd = ["git", "diff", "--name-only"]
-            output_lines = (
-                subprocess.check_output(
-                    cmd, env_overrides=env_overrides, encoding="utf-8", cwd=self.path
-                )
-                .strip()
-                .splitlines()
-            )
-            # This finds all untracked files that are not in the index.
-            cmd = ["git", "ls-files", "--others", "--exclude-standard"]
-            output_lines += (
-                subprocess.check_output(
-                    cmd, env_overrides=env_overrides, encoding="utf-8", cwd=self.path
-                )
-                .strip()
-                .splitlines()
+            out = subprocess.check_output(
+                ["git", "diff", "--name-only"],
+                env_overrides=env_overrides,
+                encoding="utf-8",
+                cwd=self.path,
             )
         except subprocess.CalledProcessError as e:
             sys.exit(translate_subprocess_exit_code(e.returncode))
+        return [p.replace("\\", "/") for p in out.strip().splitlines()]
 
-        return [p.replace("\\", "/") for p in output_lines]
+    def _git_ls_others_paths(self):
+        """Returns paths in the working directory that are not tracked in the workdir-index."""
+        env_overrides = {"GIT_INDEX_FILE": str(self.index_path)}
+        try:
+            out = subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                env_overrides=env_overrides,
+                encoding="utf-8",
+                cwd=self.path,
+            )
+        except subprocess.CalledProcessError as e:
+            sys.exit(translate_subprocess_exit_code(e.returncode))
+        return [p.replace("\\", "/") for p in out.strip().splitlines()]
+
+    def dirty_paths(self):
+        return self._git_diff_paths() + self._git_ls_others_paths()
+
+    def add_paths_to_index(self, rel_paths):
+        """
+        Adds the given working-directory paths to the workdir-index so subsequent calls to
+        dirty_paths() can detect changes to them via git's mtime optimisation.
+        """
+        if not rel_paths:
+            return
+        _add_paths_to_workdir_index(self.repo, self.index_path, self.path, rel_paths)
 
     def dirty_paths_by_dataset_path(self, dirty_paths=None):
         """Returns all the deltas from self.raw_diff_from_index() but grouped by dataset path."""
@@ -913,6 +929,115 @@ class FileSystemWorkingCopy(WorkingCopyPart):
         return WorkdirDiffCache(self)
 
 
+class AttachmentWorkdirIndex:
+    """
+    Lightweight workdir-index manager for repos that have attachment files but no tile datasets.
+
+    FileSystemWorkingCopy manages the workdir-index for tile datasets. For tabular-only repos,
+    Kart still writes attachment files to the working directory, but there is no FileSystemWorkingCopy
+    to track them. This class fills that gap by creating and managing just the index file
+    (.kart/workdir-index), without any tile-dataset-specific infrastructure (no reflink check,
+    no workdir-state.db, no tile checkout logic).
+    """
+
+    def __init__(self, repo):
+        self.repo = repo
+        self.path = repo.workdir_path
+        self.index_path = repo.gitdir_file("workdir-index")
+
+    def create_if_missing(self):
+        """Creates an empty workdir-index if it does not already exist."""
+        if not self.index_path.is_file():
+            idx = pygit2.Index(str(self.index_path))
+            idx._repo = self.repo
+            idx.write()
+
+    def _git_diff_paths(self):
+        if not self.index_path.is_file():
+            return []
+        env_overrides = {"GIT_INDEX_FILE": str(self.index_path)}
+        try:
+            out = subprocess.check_output(
+                ["git", "diff", "--name-only"],
+                env_overrides=env_overrides,
+                encoding="utf-8",
+                cwd=self.path,
+            )
+        except subprocess.CalledProcessError:
+            return []
+        return [p.replace("\\", "/") for p in out.strip().splitlines()]
+
+    def _git_ls_others_paths(self):
+        if not self.index_path.is_file():
+            return []
+        env_overrides = {"GIT_INDEX_FILE": str(self.index_path)}
+        try:
+            out = subprocess.check_output(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                env_overrides=env_overrides,
+                encoding="utf-8",
+                cwd=self.path,
+            )
+        except subprocess.CalledProcessError:
+            return []
+        return [p.replace("\\", "/") for p in out.strip().splitlines()]
+
+    def dirty_paths(self):
+        return self._git_diff_paths() + self._git_ls_others_paths()
+
+    def add_paths_to_index(self, rel_paths):
+        """Adds working-directory paths to the workdir-index for dirty tracking."""
+        if not rel_paths or not self.index_path.is_file():
+            return
+        _add_paths_to_workdir_index(self.repo, self.index_path, self.path, rel_paths)
+
+    def workdir_diff_cache(self):
+        return WorkdirDiffCache(self)
+
+
+def _add_paths_to_workdir_index(repo, index_path, workdir_path, rel_paths):
+    """
+    Adds working-directory paths to the workdir-index (index_path) so that subsequent git diff
+    calls against that index can detect modifications via git's mtime optimisation.
+
+    Each path is hashed to get its current blob OID, then an IndexEntry is written directly via
+    pygit2.  This avoids using 'git update-index --stdin' which silently ignores paths when
+    GIT_INDEX_FILE points to a file other than the repository's main .git/index.
+    """
+    if not rel_paths or not index_path.is_file():
+        return
+
+    # Hash each file and write it to the object database (-w), so that git diff
+    # can later read the blob when comparing the index against the working tree.
+    oids = {}
+    for rel in rel_paths:
+        abs_path = workdir_path / rel
+        if not abs_path.is_file():
+            continue
+        try:
+            result = subprocess.check_output(
+                ["git", "hash-object", "-w", "--no-filters", str(abs_path)],
+                encoding="utf-8",
+                cwd=workdir_path,
+            )
+            oids[rel] = result.strip()
+        except subprocess.CalledProcessError:
+            pass
+
+    if not oids:
+        return
+
+    idx = pygit2.Index(str(index_path))
+    idx._repo = repo
+    for rel, oid_hex in oids.items():
+        try:
+            entry = pygit2.IndexEntry(rel, pygit2.Oid(hex=oid_hex), pygit2.GIT_FILEMODE_BLOB)
+            idx.add(entry)
+        except Exception:
+            pass
+    idx.write()
+
+
 class WorkdirDiffCache:
     """
     When we do use the index to diff the workdir, we get a diff for the entire workdir.
@@ -923,19 +1048,33 @@ class WorkdirDiffCache:
     - We want to run it as soon a the first dataset needs this info, then cache the result
     - We want the result to stay cached for the duration of the diff operation, but no longer
       (in eg a long-running test, there might be several diffs run and the workdir might change)
+
+    The delegate may be either a FileSystemWorkingCopy (for repos with tile datasets) or an
+    AttachmentWorkdirIndex (for tabular-only repos that still have attachment files).
     """
 
     def __init__(self, delegate):
         self.delegate = delegate
 
     @functools.lru_cache(maxsize=1)
+    def _git_diff_paths(self):
+        return self.delegate._git_diff_paths()
+
+    @functools.lru_cache(maxsize=1)
+    def _git_ls_others_paths(self):
+        return self.delegate._git_ls_others_paths()
+
+    @functools.lru_cache(maxsize=1)
     def dirty_paths(self):
-        return self.delegate.dirty_paths()
+        return self._git_diff_paths() + self._git_ls_others_paths()
 
     @functools.lru_cache(maxsize=1)
     def dirty_paths_by_dataset_path(self):
         # Make sure self.dirty_paths gets cached too:
         dirty_paths = self.dirty_paths()
+        if not hasattr(self.delegate, "dirty_paths_by_dataset_path"):
+            # AttachmentWorkdirIndex: no tile datasets, so all dirty paths are attachments (key=None).
+            return {None: dirty_paths} if dirty_paths else {}
         return self.delegate.dirty_paths_by_dataset_path(dirty_paths)
 
     def dirty_paths_for_dataset(self, dataset):
@@ -944,3 +1083,14 @@ class WorkdirDiffCache:
         else:
             path = dataset.path
         return self.dirty_paths_by_dataset_path().get(path, ())
+
+    @functools.lru_cache(maxsize=1)
+    def dirty_attachment_paths(self):
+        """
+        Returns the subset of dirty_paths() that are attachment file paths (not inside any dataset
+        directory and not a Kart-internal file).  These are the "leftover" paths after
+        dirty_paths_by_dataset_path() has assigned each path to its owning dataset.
+        """
+        from kart.diff_util import is_attachment_path
+
+        return [p for p in self.dirty_paths() if is_attachment_path(p)]
