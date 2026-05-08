@@ -128,10 +128,13 @@ class FileSystemWorkingCopy(WorkingCopyPart):
         return wc
 
     def status(self):
-        existing_files = [f for f in self._required_paths if f.is_file()]
-        if not existing_files:
+        # workdir-state.db is the reliable indicator that a tile working copy has been
+        # created. workdir-index may also be created by AttachmentWorkdirIndex in
+        # tabular-only repos that have attachment files, so its presence alone does not
+        # mean a tile working copy exists.
+        if not self.state_path.is_file():
             return FileSystemWorkingCopyStatus.UNCREATED
-        if existing_files == self._required_paths:
+        if self.index_path.is_file():
             return FileSystemWorkingCopyStatus.CREATED
         return FileSystemWorkingCopyStatus.PARTIALLY_CREATED
 

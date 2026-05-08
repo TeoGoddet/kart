@@ -226,6 +226,9 @@ def checkout(
         repo.configure_do_checkout_datasets(non_checkout_spec, False)
 
     TableWorkingCopy.ensure_config_exists(repo)
+    # Capture old_tree before set_head so _remove_deleted_attachment_files can compare
+    # the tree before the switch with the tree after.
+    old_tree = repo.head_tree if not repo.head_is_unborn else None
     repo.set_head(head_ref)
 
     repo_key_filter = (
@@ -239,7 +242,6 @@ def checkout(
         else ()
     )
 
-    old_tree = repo.head_tree if not repo.head_is_unborn else None
     if do_switch_commit or do_switch_spatial_filter or discard_changes:
         # Changing commit, changing spatial filter, or discarding changes mean we need to update every dataset:
         repo.working_copy.reset_to_head(
